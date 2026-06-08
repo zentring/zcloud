@@ -1,4 +1,4 @@
-# install.ps1 — fetch the latest zcloud.exe, verify its checksum, drop it on
+﻿# install.ps1 — fetch the latest zcloud.exe, verify its checksum, drop it on
 # PATH. Idempotent; safe to re-run to upgrade. Windows amd64 + arm64.
 #
 # Channels (via env):
@@ -45,8 +45,20 @@ try {
     throw "download failed: $url`n$($_.Exception.Message)"
 }
 
-# SHA256 verification is best-effort: missing SHA256SUMS shouldn't block
-# install, but a mismatch must abort.
+# SHA256 verification is best-effort: a network blip fetching the sums file
+# must not block install, but a successful fetch with a mismatch has to
+# abort. Two important details for the catch:
+#
+#   1. Use a bare catch (no type filter). Earlier we filtered on
+#      [System.Net.WebException] which only exists in Windows PowerShell
+#      5.1; PS 7+ wraps the same failure as
+#      Microsoft.PowerShell.Commands.HttpResponseException, the filter
+#      never matched, and $ErrorActionPreference=Stop killed the script.
+#      That's what the recent "504 Gateway Time-out" install failures
+#      were really hitting.
+#   2. Re-throw the literal "checksum mismatch" exception so the bare
+#      catch still aborts when bytes are wrong (only network errors slip
+#      through to the warning path).
 try {
     $sumsRaw = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
     $expected = ($sumsRaw -split "`n" |
@@ -57,12 +69,15 @@ try {
         $actual = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
         if ($expected -ne $actual) {
             Remove-Item $tmp -Force
-            throw "checksum mismatch — expected $expected, got $actual"
+            throw "CHECKSUM_MISMATCH expected=$expected actual=$actual"
         }
         Say 'Checksum verified'
     }
-} catch [System.Net.WebException] {
-    Write-Host 'WARNING: could not fetch SHA256SUMS, skipping verification' -ForegroundColor Yellow
+} catch {
+    if ($_.Exception.Message -match 'CHECKSUM_MISMATCH') {
+        throw $_
+    }
+    Write-Host "WARNING: could not fetch / verify SHA256SUMS ($($_.Exception.Message.Split([Environment]::NewLine)[0])), skipping verification" -ForegroundColor Yellow
 }
 
 Move-Item -Force $tmp $dest
