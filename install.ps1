@@ -1,4 +1,4 @@
-﻿# install.ps1 — fetch the latest zcloud.exe, verify its checksum, drop it on
+# install.ps1 — fetch the latest zcloud.exe, verify its checksum, drop it on
 # PATH. Idempotent; safe to re-run to upgrade. Windows amd64 + arm64.
 #
 # Channels (via env):
