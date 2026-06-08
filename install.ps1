@@ -14,17 +14,55 @@ $Channel = if ($env:ZCLOUD_CHANNEL) { $env:ZCLOUD_CHANNEL } else { 'stable' }
 
 function Say($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
+# InvokeWithRetry runs $scriptBlock up to $Attempts times with exponential
+# backoff. Used for every network call so a transient GitHub 504 (very
+# common on releases/* endpoints) doesn't blow up the install. Returns the
+# scriptBlock's result; rethrows the last exception only after exhausting
+# the budget.
+function InvokeWithRetry {
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$Attempts = 4,
+        [string]$Label = 'request'
+    )
+    $delay = 1
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            if ($i -eq $Attempts) {
+                throw
+            }
+            Write-Host "  $Label attempt $i/$Attempts failed ($($_.Exception.Message.Split([Environment]::NewLine)[0])), retrying in ${delay}s" -ForegroundColor Yellow
+            Start-Sleep -Seconds $delay
+            $delay = [Math]::Min($delay * 2, 8)
+        }
+    }
+}
+
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     'AMD64' { 'amd64' }
     'ARM64' { 'arm64' }
     default { throw "unsupported arch: $env:PROCESSOR_ARCHITECTURE" }
 }
 
-$base = switch ($Channel) {
-    'stable'  { "https://github.com/$Repo/releases/latest/download" }
-    'rolling' { "https://github.com/$Repo/releases/download/rolling" }
-    default   { "https://github.com/$Repo/releases/download/$Channel" }
+# Pin the tag up-front so every later URL skips GitHub's `latest/download`
+# redirect resolver — that resolver is the recurring 504 source. For
+# `stable` we resolve via the API once; rolling and explicit tags already
+# bypass the resolver and need no extra hop.
+$tag = switch ($Channel) {
+    'stable' {
+        Say 'Resolving latest stable release'
+        $api = "https://api.github.com/repos/$Repo/releases/latest"
+        $rel = InvokeWithRetry -Label 'release lookup' -ScriptBlock {
+            Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ 'User-Agent' = 'zcloud-installer' }
+        }
+        $rel.tag_name
+    }
+    'rolling' { 'rolling' }
+    default   { $Channel }
 }
+$base = "https://github.com/$Repo/releases/download/$tag"
 
 $asset    = "zcloud-windows-$arch.exe"
 $url      = "$base/$asset"
@@ -38,9 +76,11 @@ New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $dest = Join-Path $installDir $BinName
 $tmp  = "$dest.tmp"
 
-Say "Downloading $asset ($Channel)"
+Say "Downloading $asset ($tag)"
 try {
-    Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+    InvokeWithRetry -Label 'binary download' -ScriptBlock {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+    } | Out-Null
 } catch {
     throw "download failed: $url`n$($_.Exception.Message)"
 }
@@ -54,13 +94,13 @@ try {
 #      5.1; PS 7+ wraps the same failure as
 #      Microsoft.PowerShell.Commands.HttpResponseException, the filter
 #      never matched, and $ErrorActionPreference=Stop killed the script.
-#      That's what the recent "504 Gateway Time-out" install failures
-#      were really hitting.
 #   2. Re-throw the literal "checksum mismatch" exception so the bare
 #      catch still aborts when bytes are wrong (only network errors slip
 #      through to the warning path).
 try {
-    $sumsRaw = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
+    $sumsRaw = InvokeWithRetry -Label 'SHA256SUMS' -ScriptBlock {
+        (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
+    }
     $expected = ($sumsRaw -split "`n" |
         Where-Object { $_ -match [Regex]::Escape($asset) } |
         ForEach-Object { ($_ -split '\s+')[0] } |

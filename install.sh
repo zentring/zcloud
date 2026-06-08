@@ -23,6 +23,30 @@ require() {
 require curl
 require uname
 
+# retry_curl runs curl with the given args up to 4 times with exponential
+# backoff. Every release/api hit goes through this because GitHub's
+# `releases/latest/*` redirect resolver occasionally returns 504; without
+# retry a single CDN hiccup tanks the install.
+retry_curl() {
+    delay=1
+    i=1
+    max=4
+    while [ "$i" -le "$max" ]; do
+        if curl --connect-timeout 15 --max-time 120 "$@"; then
+            return 0
+        fi
+        if [ "$i" -eq "$max" ]; then
+            return 1
+        fi
+        printf '  attempt %d/%d failed, retrying in %ds\n' "$i" "$max" "$delay" >&2
+        sleep "$delay"
+        delay=$(( delay * 2 ))
+        [ "$delay" -gt 8 ] && delay=8
+        i=$(( i + 1 ))
+    done
+    return 1
+}
+
 case "$(uname -s)" in
     Linux)  os="linux"  ;;
     Darwin) os="darwin" ;;
@@ -35,11 +59,22 @@ case "$(uname -m)" in
     *) die "unsupported arch: $(uname -m)" ;;
 esac
 
+# Resolve a concrete tag so subsequent URLs skip the `releases/latest/download`
+# redirect resolver. That resolver is the recurring 504 source on stable
+# installs; the per-tag URL pattern doesn't go through it.
 case "$CHANNEL" in
-    stable)  base="https://github.com/${REPO}/releases/latest/download" ;;
-    rolling) base="https://github.com/${REPO}/releases/download/rolling" ;;
-    *)       base="https://github.com/${REPO}/releases/download/${CHANNEL}" ;;
+    stable)
+        say "Resolving latest stable release"
+        api="https://api.github.com/repos/${REPO}/releases/latest"
+        rel="$(retry_curl -fsSL -H 'User-Agent: zcloud-installer' "$api" 2>/dev/null)" \
+            || die "could not resolve latest tag from ${api}"
+        tag="$(printf '%s' "$rel" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        [ -n "$tag" ] || die "release lookup returned no tag_name"
+        ;;
+    rolling) tag="rolling" ;;
+    *)       tag="$CHANNEL" ;;
 esac
+base="https://github.com/${REPO}/releases/download/${tag}"
 
 asset="zcloud-${os}-${arch}"
 url="${base}/${asset}"
@@ -58,14 +93,14 @@ fi
 tmp="$(mktemp)"
 trap 'rm -f "$tmp" "${tmp}.sums" 2>/dev/null || true' EXIT INT TERM
 
-say "Downloading ${asset} (${CHANNEL})"
-if ! curl -fSL --progress-bar "$url" -o "$tmp"; then
+say "Downloading ${asset} (${tag})"
+if ! retry_curl -fSL --progress-bar "$url" -o "$tmp"; then
     die "download failed: ${url}"
 fi
 
 # SHA256 verification is best-effort: missing SHA256SUMS shouldn't block install
 # (some pinned tags might predate the bundle), but a mismatch must abort.
-if curl -fsSL "$sums_url" -o "${tmp}.sums" 2>/dev/null; then
+if retry_curl -fsSL "$sums_url" -o "${tmp}.sums" 2>/dev/null; then
     expected="$(awk -v a="$asset" '$2 == a || $2 == "*"a { print $1 }' "${tmp}.sums")"
     if [ -n "$expected" ]; then
         if command -v sha256sum >/dev/null 2>&1; then
