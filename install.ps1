@@ -40,6 +40,26 @@ function InvokeWithRetry {
     }
 }
 
+# Get-RedirectTag resolves a /releases/latest URL to its tag via the 302 it
+# returns, without touching api.github.com. PowerShell 5.1 throws on a 3xx when
+# MaximumRedirection is 0 (Location lives on the exception's Response); 7+ hands
+# the response back directly — read Location from whichever path we land on.
+function Get-RedirectTag {
+    param([string]$Url)
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+    } catch {
+        $resp = $_.Exception.Response
+    }
+    $loc = $null
+    if ($resp) { try { $loc = $resp.Headers.Location } catch { $loc = $null } }
+    if ($loc -is [array]) { $loc = $loc[0] }
+    if ($loc -and $loc.AbsoluteUri) { $loc = $loc.AbsoluteUri }
+    $loc = [string]$loc
+    if ($loc -notmatch '/tag/([^/]+)/?$') { throw "no usable redirect from $Url (got '$loc')" }
+    return $Matches[1]
+}
+
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     'AMD64' { 'amd64' }
     'ARM64' { 'arm64' }
@@ -47,17 +67,24 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 
 # Pin the tag up-front so every later URL skips GitHub's `latest/download`
-# redirect resolver — that resolver is the recurring 504 source. For
-# `stable` we resolve via the API once; rolling and explicit tags already
-# bypass the resolver and need no extra hop.
+# redirect resolver. For `stable` we resolve via two independent sources so a
+# 504 on either keeps installs working: the JSON API first, then the web
+# redirect on github.com — the same host the binary download uses, so if that's
+# reachable the redirect resolves too. Rolling and explicit tags need no lookup.
 $tag = switch ($Channel) {
     'stable' {
         Say 'Resolving latest stable release'
         $api = "https://api.github.com/repos/$Repo/releases/latest"
-        $rel = InvokeWithRetry -Label 'release lookup' -ScriptBlock {
-            Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ 'User-Agent' = 'zcloud-installer' }
+        try {
+            $rel = InvokeWithRetry -Label 'release lookup' -ScriptBlock {
+                Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ 'User-Agent' = 'zcloud-installer' }
+            }
+            $rel.tag_name
+        } catch {
+            Write-Host '  API lookup failed; falling back to release redirect' -ForegroundColor Yellow
+            $latest = "https://github.com/$Repo/releases/latest"
+            InvokeWithRetry -Label 'release redirect' -ScriptBlock { Get-RedirectTag -Url $latest }
         }
-        $rel.tag_name
     }
     'rolling' { 'rolling' }
     default   { $Channel }

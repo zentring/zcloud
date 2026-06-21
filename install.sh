@@ -47,6 +47,27 @@ retry_curl() {
     return 1
 }
 
+# resolve_stable_tag prints the newest stable tag. It tries the JSON API first,
+# then falls back to the web redirect on github.com — the same host the binary
+# download uses, so if that's reachable the redirect resolves too. Either source
+# surviving keeps `stable` installs working through a one-host 504. Prints the
+# tag on stdout; returns non-zero only when both sources fail.
+resolve_stable_tag() {
+    api="https://api.github.com/repos/${REPO}/releases/latest"
+    if rel="$(retry_curl -fsSL -H 'User-Agent: zcloud-installer' "$api" 2>/dev/null)"; then
+        t="$(printf '%s' "$rel" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+    fi
+    printf '  API lookup failed; falling back to release redirect\n' >&2
+    latest="https://github.com/${REPO}/releases/latest"
+    # -L follows the 302; %{url_effective} prints the final /releases/tag/<tag> URL.
+    if loc="$(retry_curl -fsSL -o /dev/null -w '%{url_effective}' "$latest" 2>/dev/null)"; then
+        t="$(printf '%s' "$loc" | sed -n 's#.*/releases/tag/\([^/]*\)$#\1#p')"
+        if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+    fi
+    return 1
+}
+
 case "$(uname -s)" in
     Linux)  os="linux"  ;;
     Darwin) os="darwin" ;;
@@ -60,16 +81,13 @@ case "$(uname -m)" in
 esac
 
 # Resolve a concrete tag so subsequent URLs skip the `releases/latest/download`
-# redirect resolver. That resolver is the recurring 504 source on stable
-# installs; the per-tag URL pattern doesn't go through it.
+# redirect resolver. `stable` resolves via two independent sources (API, then
+# web redirect) so a 504 on either doesn't tank the install.
 case "$CHANNEL" in
     stable)
         say "Resolving latest stable release"
-        api="https://api.github.com/repos/${REPO}/releases/latest"
-        rel="$(retry_curl -fsSL -H 'User-Agent: zcloud-installer' "$api" 2>/dev/null)" \
-            || die "could not resolve latest tag from ${api}"
-        tag="$(printf '%s' "$rel" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-        [ -n "$tag" ] || die "release lookup returned no tag_name"
+        tag="$(resolve_stable_tag)" \
+            || die "could not resolve latest stable tag (API and redirect both failed)"
         ;;
     rolling) tag="rolling" ;;
     *)       tag="$CHANNEL" ;;
